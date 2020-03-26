@@ -1,9 +1,6 @@
 ----------------------- MODULE ViewStampedReplication -----------------------
 \* TODO - Model crashes and recoveries of less than majority processes
-\* TODO - View change without flooding of start_view_change message
-
-\* Invariant - commit of other processes <= leader always
-\* Invariant - commit at leader only if majority accepts were receievd
+\* TODO P4 - View change without flooding of start_view_change message.
 
 \* Challenges - running with view change is tough, have to limit the model till a maximum view number.
 
@@ -17,6 +14,12 @@ CONSTANT
 VARIABLES
     messages,
     processState
+
+PossibleLogSeqences(S) == {possible_seq \in UNION {[1..n -> S] : n \in 0..Cardinality({2, 3})}: (\A a, b \in 1..Len(possible_seq): (a = b \/ possible_seq[a] # possible_seq[b]))}
+
+VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [view_num : 0..MaxViewNum, commit_num: 0..Cardinality(ClientCommands),
+                status: {"normal", "view_change", "do_view_change_sent"}, last_active_view_num: 0..MaxViewNum,
+                log: PossibleLogSeqences(ClientCommands)]]
 
 VRInit == /\ messages = {}
           /\ processState = 
@@ -160,7 +163,7 @@ viewChangeTransitions(p) ==
                                 /\ processState' = [processState EXCEPT ![p].status = "do_view_change_sent"]
                              )
                           \/ (
-                                \* In view_change status, but got view_change with higher number.
+                                \* Remove? - In view_change status, but got view_change with higher number.
                                 /\ \* Got larger start_view_change msg from another node.
                                    (\E msg \in messages: msg.type = "start_view_change" /\ msg.view_num > processState[p].view_num
                                       /\ sendStartViewChange(p, msg.view_num))
@@ -202,7 +205,7 @@ recvMajortiyDoViewChange(p, v) == /\ LET
                                         }
                                         maxLogMsg == IF mset = {} THEN -1
                                             ELSE CHOOSE msg \in mset : \A msg2 \in mset :
-                                                (\/ (msg.last_active_view_num \geq msg2.last_active_view_num)
+                                                (\/ (msg.last_active_view_num > msg2.last_active_view_num)
                                                  \/ (/\ msg.last_active_view_num = msg2.last_active_view_num /\ Len(msg.log) \geq Len(msg2.log)))
                                    IN /\ Cardinality(mset) >= ((NumProcesses \div 2) + 1)
                                       /\ processState' = [processState EXCEPT ![p].view_num = v,
@@ -219,7 +222,7 @@ VRNext == \/ (\E p \in 0..NumProcesses-1: isLeader(p) /\ processState[p].status 
                     \* Note that leader can advance commit numbers non-sequentially, keep in mind.
                     /\ isLeader(p)
                     /\ processState[p].status = "normal"
-                    /\ \E log_num \in 1..Len(processState[p].log): majorityReplicated(p, log_num) /\ (advanceCommitNumber(p, log_num)) 
+                    /\ \E log_num \in (processState[p].commit_num+1)..Len(processState[p].log): majorityReplicated(p, log_num) /\ (advanceCommitNumber(p, log_num))
                     /\ UNCHANGED <<messages>>
                 )
              )
@@ -237,4 +240,39 @@ VRNext == \/ (\E p \in 0..NumProcesses-1: isLeader(p) /\ processState[p].status 
                     )
                 )
              )
+
+(* Invariant - for any two processes, log till lesser commit number is the same (Prefix property) *)
+
+\* True if sequence a is a prefix of b
+PrefixOf(a, b) == /\ Len(a) <= Len(b)
+                  /\ \A i \in 1..Len(a): a[i] = b[i]
+
+PrefixLogConsistency == \A a, b \in 0..NumProcesses-1:
+                            \/ a = b
+                            \/ PrefixOf(
+                                SubSeq(processState[a].log, 1, processState[a].commit_num),
+                                SubSeq(processState[b].log, 1, processState[b].commit_num))
+                            \/ PrefixOf(
+                                SubSeq(processState[b].log, 1, processState[b].commit_num),
+                                SubSeq(processState[a].log, 1, processState[a].commit_num))
+
+(* Invariant - process with higher view_num in normal state has larger commit num than process in lower view_num *)
+ViewNumCommitNumInv == \A a, b \in 0..NumProcesses-1:
+                            \/ a = b
+                            \/ IF /\ processState[a].status = "normal"
+                                  /\ processState[b].status = "normal"
+                                  /\ processState[a].view_num < processState[b].view_num
+                               THEN processState[a].commit_num <= processState[b].commit_num
+                               ELSE TRUE
+
+(* Invariant - commit number of other processes <= leader's commit always *)
+LeaderCommitNumInv == \A a, b \in 0..NumProcesses-1:
+                            \/ a = b
+                            \/ IF /\ processState[a].status = "normal"
+                                  /\ processState[b].status = "normal"
+                                  /\ processState[a].view_num = processState[b].view_num
+                                  /\ isLeader(a)
+                               THEN processState[a].commit_num >= processState[b].commit_num
+                               ELSE TRUE
+
 =============================================================================
