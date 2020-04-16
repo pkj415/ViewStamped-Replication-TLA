@@ -1,5 +1,4 @@
 ----------------------- MODULE ViewStampedReplication -----------------------
-\* TODO - Model crashes and recoveries of less than majority processes
 \* TODO P4 - View change without flooding of start_view_change message.
 
 \* Challenges - running with view change is tough, have to limit the model till a maximum view number.
@@ -14,7 +13,8 @@ EXTENDS Integers, Sequences, FiniteSets
 CONSTANT
     NumProcesses,   \* The set of processes
     ClientCommands, \* The set of client commands. For now each client has just one command
-    MaxViewNum
+    MaxViewNum,
+    MaxFailures
 
 VARIABLES
     messages,
@@ -24,7 +24,7 @@ VARIABLES
                 view_num |-> 0,
                 log |-> <<>>,
                 commit_num |-> 0,
-                status |-> "normal" / "view_change" / "do_view_change_sent",
+                status |-> "normal" / "view_change" / "do_view_change_sent"/ "recovering",
                 last_active_view_num |-> 0
             ]
     *)
@@ -69,7 +69,6 @@ sendCommits(p) == /\ sendMsgs(
                              commit_num |-> processState[p].commit_num]: listener \in 0..NumProcesses-1 \ {p}
                         }
                      )
-                  /\ UNCHANGED <<processState>>
 
 \* Check if there are atleast NumProcesses/2 PREPAREOKs. Note that there is an implicit self PREPAREOK which completes the majority.
 majorityPREPAREOKs(p, log_num) == LET mset == {
@@ -211,57 +210,145 @@ recvMajortiyDoViewChange(p, v) == LET
                                                                              ![p].last_active_view_num = v]
                                      /\ sendStartView(p, v, maxLogMsg)
 
+NormalCaseOperation(p) ==  \/
+                              \* A process, which thinks it is the leader, sends PREPARE messages.
+                              /\ isLeader(p)
+                              /\ sendPrepares(p)
+                              /\ UNCHANGED <<>>
+        
+                           \/
+                              \* A process, which thinks it is the leader, sends COMMIT messages.
+                              /\ isLeader(p)
+                              /\ sendCommits(p)
+                              /\ UNCHANGED <<processState>>
+        
+                           \/ \* A process, which thinks it is the leader, advances its commit number if majority PREPAREOKs have been received.
+                              \* Note that a leader can advance commit numbers non-sequentially.
+                              /\ isLeader(p)
+                              /\ \E log_num \in (processState[p].commit_num+1)..Len(processState[p].log):
+                                   /\ majorityPREPAREOKs(p, log_num)
+                                   /\ processState' = [processState EXCEPT ![p].commit_num = log_num]
+                              /\ UNCHANGED <<messages>>
+        
+                           \/ \* Normal case operation of a replica node.
+                              /\ ~isLeader(p)
+                              /\
+                                 \/
+                                    /\ acceptPrepare(p)
+                                    /\ UNCHANGED <<>>
+                                 \/
+                                    /\ acceptCommit(p)
+                                    /\ UNCHANGED <<messages>>
+
+                           \/ \* Respond to RECOVERY messages.
+                              /\ \E msg \in messages:
+                                   /\ msg.type = "RECOVERY"
+                                   /\
+                                      \/ 
+                                         /\ isLeader(p)
+                                         /\ sendMsgs(
+                                            {
+                                              [type |-> "RECOVERYRESPONSE",
+                                               from |-> p,
+                                               to |-> msg.from,
+                                               view_num |-> processState[p].view_num,
+                                               commit_num |-> processState[p].commit_num,
+                                               log |-> processState[p].log,
+                                               nonce |-> msg.nonce]
+                                            })
+                                       \/
+                                          /\ ~isLeader(p)
+                                          /\ sendMsgs(
+                                             {
+                                               [type |-> "RECOVERYRESPONSE",
+                                                from |-> p,
+                                                to |-> msg.from,
+                                                view_num |-> processState[p].view_num,
+                                                nonce |-> msg.nonce]
+                                             })
+                                   /\ UNCHANGED <<processState>>
+
+\* When a node fails, it loses all data and goes into recovering status.
+FailNode(p) == 
+               /\ processState' = [processState EXCEPT ![p].commit_num = 0,
+                                                       ![p].view_num = 0,
+                                                       ![p].last_active_view_num = 0,
+                                                       ![p].log = <<>>,
+                                                       ![p].status = "recovering"]
+               /\ sendMsgs(
+                                {
+                                    [type |-> "RECOVERY",
+                                     from |-> p,
+                                     nonce |-> processState[p].nonce]
+                                }
+                             )
+
+\* There are a few ways to handle nonce, this spec follows the first one -
+\* 1. Store it on disk and increment it just before a node marks itself "normal".
+\* 2. Store it on disk and increment it whenever a node restarts to come into "recovering" status. But this has higher message
+\*    complexity considering this scneario - if an already recovering node restarts, it will ignore the RECOVERYRESPONSE
+\*    messages from all other nodes since they are from an ealier nonce, even though using those responses would have not violateed
+\*    safety. This will require another set of RECOVERYRESPONSE messages.
+\* 3. Use a clock value to generate nonce
+
+Recover(p) == LET
+                    \* There might be more than one RECOVERYRESPONSE messages from the same process.
+                    mset == {
+                        msg \in messages: /\ msg.type = "RECOVERYRESPONSE"
+                                          /\ msg.nonce = processState[p].nonce
+                                          /\ msg.to = p
+                    }
+                    sender_set == {p_id \in 0..NumProcesses-1: (\E msg \in mset: msg.from = p_id)}
+                    maxViewMsg == IF mset = {} THEN <<>>
+                        ELSE CHOOSE msg \in mset : \A msg2 \in mset :
+                          \/ (msg.view_num >= msg2.view_num)
+                    maxViewNum == IF maxViewMsg = <<>> THEN -1
+                                  ELSE maxViewMsg.view_num
+              IN 
+                 /\ processState[p].nonce < MaxFailures
+                 /\ Cardinality(sender_set) >= ((NumProcesses \div 2) + 1)
+                 \* Very important - 
+                 \* Step through all behaviours where process p chooses any of the RECOVERYRESPONSEs from the leader of maxViewNum.
+                 /\ \E msg \in mset:
+                      /\ msg.from = maxViewNum % NumProcesses
+                      /\ msg.view_num = maxViewNum \* This is important, if this check is not included, an older RECOVERYRESPONSE from the leader might be used. TODO - Bring in an invariant
+                      /\ processState' = [processState EXCEPT ![p].view_num = maxViewNum,
+                                                              ![p].status = "normal",
+                                                              ![p].log = msg.log,
+                                                              ![p].commit_num = msg.commit_num,
+                                                              ![p].last_active_view_num = maxViewNum,
+                                                              \* TODO - Consider the case where the process increments
+                                                              \* the nonce and then fails again. Right now, switching
+                                                              \* to normal and nonce incrementing is atomic, but
+                                                              \* it should not be so.
+                                                              ![p].nonce = processState[p].nonce + 1]
+
 VRInit == /\ messages = {}
           /\ processState =
                     [p \in 0..NumProcesses-1 |-> [
                                                     view_num |-> 0,
                                                     log |-> <<>>,
                                                     commit_num |-> 0,
-                                                    status |-> "normal", \* normal, view_change, do_view_change_sent
-                                                    last_active_view_num |-> 0
+                                                    status |-> "normal", \* normal, view_change, do_view_change_sent, recovering
+                                                    last_active_view_num |-> 0,
+                                                    nonce |-> 0
                                                   ]
                     ]
 
-NormalCaseOperation == \/
-                          \* A process, which thinks it is the leader, sends PREPARE messages.
-                          /\ (\E p \in 0..NumProcesses-1: isLeader(p) /\ processState[p].status = "normal" /\ sendPrepares(p))
-                          /\ UNCHANGED <<>>
-
-                       \/
-                          \* A process, which thinks it is the leader, sends COMMIT messages.
-                          /\ (\E p \in 0..NumProcesses-1: isLeader(p) /\ processState[p].status = "normal" /\ sendCommits(p))
-
-                       \/ \* A process, which thinks it is the leader, advances its commit number if majority PREPAREOKs have been received.
-                          \* Note that a leader can advance commit numbers non-sequentially.
-                          /\ \E p \in 0..NumProcesses-1:
-                                 (
-                                     /\ isLeader(p)
-                                     /\ processState[p].status = "normal"
-                                     /\ \E log_num \in (processState[p].commit_num+1)..Len(processState[p].log):
-                                           /\ majorityPREPAREOKs(p, log_num)
-                                           /\ processState' = [processState EXCEPT ![p].commit_num = log_num]
-                                     /\ UNCHANGED <<messages>>
-                                 )
-
-                       \/ \* Normal case operation of a replica node.
-                          /\ \E p \in 0..NumProcesses-1:
-                               /\ ~isLeader(p)
-                               /\ processState[p].status = "normal"
-                               /\
-                                  \/
-                                     /\ acceptPrepare(p)
-                                     /\ UNCHANGED <<>>
-                                  \/
-                                     /\ acceptCommit(p)
-                                     /\ UNCHANGED <<messages>>
-
 VRNext ==
-          \/ \* Normal case operation
-             /\ NormalCaseOperation
+          \/ \* Normal case operation. Executed only when status of process is normal
+             /\ \E p \in 0..NumProcesses-1:
+                  /\ processState[p].status = "normal"
+                  /\ NormalCaseOperation(p)
 
-          \/ \E p \in 0..NumProcesses-1: viewChangeTransitions(p)
-          \/ (\E p \in 0..NumProcesses-1: (
-                \E v \in 0..MaxViewNum:
+          \/ \* View change transitions. All except "recovering" status nodes can take this step.
+             /\ \E p \in 0..NumProcesses-1:
+                  /\ processState[p].status # "recovering"
+                  /\ viewChangeTransitions(p)
+
+          \/ \E p \in 0..NumProcesses-1:
+               /\ processState[p].status # "recovering"
+               /\ \E v \in 0..MaxViewNum:
                     (
                         \* ~isLeader(p) is not kept here because it might happen that a leader again becomes the next leader.
                         \* TODO - What safety check would catch such an error?
@@ -272,14 +359,28 @@ VRNext ==
                         /\ v % NumProcesses = p
                         /\ recvMajortiyDoViewChange(p, v)
                     )
-                )
-             )
-          \* TODO - Recovery, State transfer, log pruning
+
+          \/ \* Fail a process. It goes to status "recovering"
+             LET
+                failed_processes == {p \in 0..NumProcesses-1: processState[p].status = "recovering"}
+             IN
+                /\ Cardinality(failed_processes) < ((NumProcesses-1) \div 2)
+                /\ \E p \in (0..NumProcesses-1 \ failed_processes):
+                     /\ FailNode(p)
+                /\ UNCHANGED <<>>
+          \/ \* Recover a recovering process, if the RECOVERYRESPONSEs have been received.
+             \E p \in {p \in 0..NumProcesses-1: processState[p].status = "recovering"}:
+                /\ Recover(p)
+                /\ UNCHANGED <<messages>>
 
 (* Invariants *)
-VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [view_num : 0..MaxViewNum, commit_num: 0..Cardinality(ClientCommands),
-                status: {"normal", "view_change", "do_view_change_sent"}, last_active_view_num: 0..MaxViewNum,
-                log: PossibleLogSeqences(ClientCommands)]]
+VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [
+                view_num : 0..MaxViewNum,
+                commit_num: 0..Cardinality(ClientCommands),
+                status: {"normal", "view_change", "do_view_change_sent", "recovering"},
+                last_active_view_num: 0..MaxViewNum,
+                log: PossibleLogSeqences(ClientCommands),
+                nonce: 0..MaxFailures]]
 
 (* Invariant - for any two processes, log till lesser commit number is the same (Prefix property) *)
 
