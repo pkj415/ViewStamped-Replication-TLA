@@ -1,9 +1,9 @@
 ----------------------- MODULE ViewStampedReplication -----------------------
-\* TODO P4 - View change without flooding of start_view_change message.
+\* TODOs -
+\*   1. Test VR with flexible quorums (just for fun to check if the spec still works fine)?
+\*   2. Reconfiguration protocol
+\*   3. Consider using symmetry sets whereever possible
 
-\* Challenges - running with view change is tough, have to limit the model till a maximum view number.
-
-\* TODO - VR with flexible quorums?
 (* Think of this - What if a process sends start_view_change immediately after a do_view_change? Can this be solved?
    For this issue, does PBFT have a solution? Because a byzantine node can do this always.
 *)
@@ -11,9 +11,15 @@
 EXTENDS Integers, Sequences, FiniteSets
 
 CONSTANT
-    NumProcesses,   \* The set of processes
-    ClientCommands, \* The set of client commands. For now each client has just one command
+    \* The total number of processes; Index of each process falls in 0..NumProcesses-1
+    NumProcesses,
+    \* Set of client commands. The specification (as of now) doesn't bother to model different clients and exactly-one semantics
+    \* as mentioned in the paper as this is not relevant to the correctness of the core consensus algorithm.
+    ClientCommands,
+    \* The maximum view number any process in any bhaviour can attain (this is to restrict the allowed behaviours that TLC scans through).
+    \* TODO - This can instead be done by specifying a State Constraint when running TLC.
     MaxViewNum,
+    \* Maximum number of process failures allowed in the behaviour (this is again to restrict the allowed behaviours that TLC scans through)
     MaxFailures
 
 VARIABLES
