@@ -1,6 +1,22 @@
 ----------------------- MODULE ViewStampedReplication -----------------------
 \* NOTE - All optimization are tagged with OPT#Num
 
+\* NOTE - For ensuring weak fairness conditions by just declaring it on VRNext as below (to stop infinite stuttering), we require
+\* each sub step (in VRNext) to be disabled ("not enabled") in case it has already been executed and rexecuting it will not change
+\* the state.
+\*      Declaration as follows - WF_vars(VRNext)
+\*
+\* If the sub-step is left enabled after execution, TLC will allow behaviours that stutter at this sub-step (making it difficult
+\* to debug if certain states are eventually reached when adding new functionality in the spec). A workaround to avoiding this is
+\* would be to declare weak fairness on each sub-step (as below), but that is cumbersome for two reasons -
+\*   1. Required changing the fairness condition when new steps are added, old ones renamed/removed.
+\*   2. If a sub-step has a parameters (say process id), then we have to specify WF conditions for all possible sub-steps as below.
+\*
+\*      Workaround declaration is as follows - \A p_id \in NumProcesses: WF_vars(sendPrepares(p_id)) /\ WF_vars(sendPrepares(p_id)) and so on...
+\*
+\* This trick is called the WfSimplifier in the spec to succinctly point out conditions added for exactly just this purpose.
+
+
 \* TODOs -
 \*   1. Test VR with flexible quorums (just for fun to check if the spec still works fine)?
 \*   2. Reconfiguration protocol
@@ -108,6 +124,24 @@ VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [
 Maximum(S) == IF S = {} THEN 0
               ELSE CHOOSE x \in S: \A y \in S: x >= y
 
+Pick(S) == CHOOSE s \in S : TRUE
+RECURSIVE SetReduce(_, _, _)
+
+\* When running TLC on large models, comment the assertion for checking commutativity.
+SetReduce(Op(_, _), S, value) ==
+  IF S = {} THEN value
+  ELSE LET s == Pick(S)
+       IN IF Op(s, value) = Op(value, s)
+       THEN SetReduce(Op, S \ {s}, Op(s, value))
+       ELSE Assert(FALSE, "oh no")
+
+Sum(S) == LET _op(a, b) == a + b
+          IN SetReduce(_op, S, 0)
+
+\* Fetch a subset of messages in the network based on the params filter.
+subsetOfMsgs(params) == {log_entry \in messages: \A field \in DOMAIN params:
+                            field \in DOMAIN log_entry /\ log_entry[field] = params[field]}
+
 \* isLeader return True if p thinks it is the leader.
 isLeader(p) == processState[p].view_num % NumProcesses = p
 
@@ -132,13 +166,17 @@ sendPrepares(p) == /\ \E cmd \in ClientCommands: (
                                )
                     )
 
-sendCommits(p) == sendMsgs(
-                    {
-                        [type |-> "COMMIT",
-                         view_num |-> processState[p].view_num,
-                         commit_num |-> processState[p].commit_num]
-                    }
-                  )
+sendCommits(p) ==
+                  /\ subsetOfMsgs(
+                        [type |-> "COMMIT", view_num |-> processState[p].view_num,
+                         commit_num |-> processState[p].commit_num]) = {} \* WfSimplifier condition
+                  /\ sendMsgs(
+                        {
+                            [type |-> "COMMIT",
+                             view_num |-> processState[p].view_num,
+                             commit_num |-> processState[p].commit_num]
+                        }
+                      )
 
 \* Check if there are atleast NumProcesses/2 PREPAREOKs. Note that there is an implicit self PREPAREOK which completes the majority.
 majorityPREPAREOKs(p, log_num) == LET mset == {
@@ -153,7 +191,9 @@ acceptPrepare(p) == /\ \E msg \in messages:
                         /\ processState[p].view_num = msg.view_num
                         /\ Len(processState[p].log) = msg.log_num - 1
                         /\ processState' = [processState EXCEPT ![p].log = Append(processState[p].log, msg.cmd),
-                                                                ![p].commit_num = msg.commit_num]
+                             ![p].commit_num = Maximum({msg.commit_num, processState[p].commit_num})] \* The commit_num on the process
+                                 \* might be > the commit_num in the message. Similar to the case when an older leader receives a
+                                 \* START-VIEW message. Refer updateBasedOnStartView step.
                         /\ sendMsgs({
                                         [type |-> "PREPAREOK",
                                          from |-> p,
@@ -189,11 +229,19 @@ sendDoViewChange(p) == sendMsgs({
         last_active_view_num |-> processState[p].last_active_view_num
     ]})
 
-updateBasedOnStartView(p, msg) == /\ processState' = [processState EXCEPT ![p].status = "normal",
-                                                                          ![p].commit_num = msg.commit_num,
-                                                                          ![p].log = msg.log,
-                                                                          ![p].last_active_view_num = msg.view_num,
-                                                                          ![p].view_num = msg.view_num]
+updateBasedOnStartView(p, msg) ==
+    /\ processState' = [processState EXCEPT ![p].status = "normal",
+          ![p].commit_num = Maximum({msg.commit_num, processState[p].commit_num}), \* It might happen that the process p was a leader before
+                \* and has commit_num greater than that in the START-VIEW message.
+          ![p].log = msg.log, \* msg.log will surely be >= Maximum(msg.commit_num, processState[p].commit_num) in length.
+          ![p].last_active_view_num = msg.view_num,
+          ![p].view_num = msg.view_num]
+    /\ \* Send PREPAREOKs for uncommitted entries.
+        sendMsgs(
+            [type: {"PREPAREOK"},
+             from: {p},
+             view_num: {msg.view_num},
+             log_num: (msg.commit_num+1)..Len(msg.log)])
 
 viewChangeTransitions(p) == 
                           \/ (
@@ -239,7 +287,7 @@ viewChangeTransitions(p) ==
                                               /\ updateBasedOnStartView(p, msg)
                                          )
                                    )
-                                /\ UNCHANGED <<messages>>
+                                /\ UNCHANGED <<>>
                              )
 
 \* There is no "to" field in start_view as it is for all replicas.
@@ -305,6 +353,9 @@ NormalCaseOperation(p) ==  \/
                                    /\
                                       \/ 
                                          /\ isLeader(p)
+                                         /\ subsetOfMsgs([type |-> "RECOVERYRESPONSE", from |-> p, to |-> msg.from,
+                                                view_num |-> processState[p].view_num, commit_num |-> processState[p].commit_num,
+                                                log |-> processState[p].log, nonce |-> msg.nonce]) = {} \* WfSimplifier condition
                                          /\ sendMsgs(
                                             {
                                               [type |-> "RECOVERYRESPONSE",
@@ -317,6 +368,9 @@ NormalCaseOperation(p) ==  \/
                                             })
                                        \/
                                           /\ ~isLeader(p)
+                                          /\ subsetOfMsgs([type |-> "RECOVERYRESPONSE", from |-> p, to |-> msg.from,
+                                                view_num |-> processState[p].view_num,
+                                                nonce |-> msg.nonce]) = {} \* WfSimplifier condition
                                           /\ sendMsgs(
                                              {
                                                [type |-> "RECOVERYRESPONSE",
@@ -327,8 +381,11 @@ NormalCaseOperation(p) ==  \/
                                              })
                                    /\ UNCHANGED <<processState>>
 
+FailuresTriggeredTillNow == Sum({processState[p_id].nonce: p_id \in 0..NumProcesses-1}) +
+                                Sum({p_id \in 0..NumProcesses-1: processState[p_id].status = "recovering"})
+
 \* When a node fails, it loses all data and goes into recovering status.
-FailNode(p) == 
+FailNode(p) == /\ FailuresTriggeredTillNow < MaxFailures
                /\ processState' = [processState EXCEPT ![p].commit_num = 0,
                                                        ![p].view_num = 0,
                                                        ![p].last_active_view_num = 0,
@@ -363,8 +420,7 @@ Recover(p) == LET
                           \/ (msg.view_num >= msg2.view_num)
                     maxViewNum == IF maxViewMsg = <<>> THEN -1
                                   ELSE maxViewMsg.view_num
-              IN 
-                 /\ processState[p].nonce < MaxFailures
+              IN
                  /\ Cardinality(sender_set) >= ((NumProcesses \div 2) + 1)
                  \* Very important - 
                  \* Step through all behaviours where process p chooses any of the RECOVERYRESPONSEs from the leader of maxViewNum.
