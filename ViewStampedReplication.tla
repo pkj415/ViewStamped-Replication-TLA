@@ -1,44 +1,112 @@
 ----------------------- MODULE ViewStampedReplication -----------------------
+\* NOTE - All optimization are tagged with OPT#Num
+
 \* TODOs -
 \*   1. Test VR with flexible quorums (just for fun to check if the spec still works fine)?
 \*   2. Reconfiguration protocol
-\*   3. Consider using symmetry sets whereever possible
+\*   3. Consider using symmetry sets where ever possible
+\*   4. Test with a rogue process to prove that it is easy to break correctness with byzantine failures.
+\*   5. Allow state transfer (catch-up)
 
-(* Think of this - What if a process sends start_view_change immediately after a do_view_change? Can this be solved?
-   For this issue, does PBFT have a solution? Because a byzantine node can do this always.
-*)
-
-EXTENDS Integers, Sequences, FiniteSets
+EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANT
     \* The total number of processes; Index of each process falls in 0..NumProcesses-1
     NumProcesses,
-    \* Set of client commands. The specification (as of now) doesn't bother to model different clients and exactly-one semantics
-    \* as mentioned in the paper as this is not relevant to the correctness of the core consensus algorithm.
+
+    \* ClientCommands is a set of distinct client commands. The specification doesn't bother to maintain a client table as
+    \* it is not relevant to the correctness of the core consensus algorithm - which is to arrive at a specific order for the
+    \* client commands in presence of failures.
     ClientCommands,
-    \* The maximum view number any process in any bhaviour can attain (this is to restrict the allowed behaviours that TLC scans through).
-    \* TODO - This can instead be done by specifying a State Constraint when running TLC.
+
+    \* The maximum view number any process in any bhaviour can attain (this is to restrict the allowed behaviours that TLC
+    \* scans through). This can also be enforced by specifying a State Constraint when running TLC.
     MaxViewNum,
-    \* Maximum number of process failures allowed in the behaviour (this is again to restrict the allowed behaviours that TLC scans through)
+
+    \* Maximum number of process failures allowed in the behaviour (this is again to restrict the allowed behaviours that TLC
+    \* scans through).
     MaxFailures
 
 VARIABLES
+    (* A set of message records. Refer the VRTypeOk invariant to understand the format of this variable. *)
     messages,
+
+    (* A function mapping process ids to their record. Refer the VRTypeOk invariant to understand the format of this variable. *)
+    processState,
+
     (*
-        A function mapping process number to process record -
-            [
-                view_num |-> 0,
-                log |-> <<>>,
-                commit_num |-> 0,
-                status |-> "normal" / "view_change" / "do_view_change_sent"/ "recovering",
-                last_active_view_num |-> 0
-            ]
+        This is used to check that every behaviour conforms with some intended behaviour specified by the LinearizableOrdering spec.
+
+        For this, the ordering variable needs to be updated on every step to reflect the ordering of executed commands
+        visible to an external user.
     *)
-    processState
+    ordering
+
+PossibleLogSeqences(S) == {possible_seq \in UNION {[1..n -> S] : n \in 0..Cardinality(S)}: (\A a, b \in 1..Len(possible_seq): (a = b \/ possible_seq[a] # possible_seq[b]))}
+
+VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [
+                view_num : 0..MaxViewNum,
+                commit_num: 0..Cardinality(ClientCommands),
+                status: {"normal", "view_change", "do_view_change_sent", "recovering"},
+                last_active_view_num: 0..MaxViewNum,
+                log: PossibleLogSeqences(ClientCommands),
+                nonce: 0..MaxFailures]]
+            /\ messages \in SUBSET (UNION {
+                [type: {"PREPARE"}, \* No "to" field as it is a broadcast msg. No "from" as view_num is enough to identify the sender
+                 cmd: ClientCommands,
+                 view_num: 0..MaxViewNum,
+                 commit_num: 0..Cardinality(ClientCommands),
+                 log_num: 0..Cardinality(ClientCommands)
+                ],
+                [type: {"PREPAREOK"}, \* No "to" field as view_num is enough to identify the receiver
+                 from: 0..NumProcesses-1,
+                 view_num: 0..MaxViewNum,
+                 log_num: 0..Cardinality(ClientCommands)
+                ],
+                [type: {"COMMIT"}, \* No "to" field as it is a broadcast msg. No "from" as view_num is enough to identify the sender
+                 view_num: 0..MaxViewNum,
+                 commit_num: 0..Cardinality(ClientCommands)
+                ],
+                [type: {"START-VIEW-CHANGE"}, \* No "to" field as it is a broadcast msg
+                 from: 0..NumProcesses-1,
+                 view_num: 0..MaxViewNum
+                ],
+                [type: {"DO-VIEW-CHANGE"}, \* No "to" field as view_num is enough to identify the receiver
+                 from: 0..NumProcesses-1,
+                 view_num: 0..MaxViewNum,
+                 log: PossibleLogSeqences(ClientCommands),
+                 commit_num: 0..Cardinality(ClientCommands),
+                 last_active_view_num: 0..MaxViewNum
+                ],
+                [type: {"START-VIEW"}, \* No "from" field as view_num is enough to identify the sender. Also, no "to" field as it is a
+                                       \* broadcast message.
+                 log: PossibleLogSeqences(ClientCommands),
+                 view_num: 0..MaxViewNum,
+                 commit_num: 0..Cardinality(ClientCommands)
+                ],
+                [type: {"RECOVERY"},
+                 from: 0..NumProcesses-1,
+                 nonce: 0..MaxFailures
+                ],
+                [type: {"RECOVERYRESPONSE"},
+                 from: 0..NumProcesses-1,
+                 to: 0..NumProcesses-1,
+                 view_num: 0..MaxViewNum,
+                 commit_num: 0..Cardinality(ClientCommands),
+                 log: PossibleLogSeqences(ClientCommands),
+                 nonce: 0..MaxFailures
+                ],
+                [type: {"RECOVERYRESPONSE"},
+                 from: 0..NumProcesses-1,
+                 to: 0..NumProcesses-1,
+                 view_num: 0..MaxViewNum,
+                 nonce: 0..MaxFailures
+                ]})
 
 (* Utility operators *)
-\* TODO - Fix Cardinality
-PossibleLogSeqences(S) == {possible_seq \in UNION {[1..n -> S] : n \in 0..Cardinality({2, 3})}: (\A a, b \in 1..Len(possible_seq): (a = b \/ possible_seq[a] # possible_seq[b]))}
+
+Maximum(S) == IF S = {} THEN 0
+              ELSE CHOOSE x \in S: \A y \in S: x >= y
 
 \* isLeader return True if p thinks it is the leader.
 isLeader(p) == processState[p].view_num % NumProcesses = p
@@ -55,85 +123,71 @@ sendPrepares(p) == /\ \E cmd \in ClientCommands: (
                       /\ processState' = [processState EXCEPT ![p].log = Append(processState[p].log, cmd)]
                       /\ sendMsgs(
                                   {
-                                      [type |-> "prepare",
-                                       to |-> listener,
-                                       from |-> p,
+                                      [type |-> "PREPARE",
                                        cmd |-> cmd,
                                        view_num |-> processState[p].view_num,
                                        commit_num |-> processState[p].commit_num,
-                                       log_num |-> Len(processState[p].log)+1] : listener \in 0..NumProcesses-1 \ {p}
+                                       log_num |-> Len(processState[p].log)+1]
                                   }
                                )
                     )
 
-sendCommits(p) == /\ sendMsgs(
-                        {
-                            [type |-> "commit",
-                             to |-> listener,
-                             from |-> p,
-                             view_num |-> processState[p].view_num,
-                             commit_num |-> processState[p].commit_num]: listener \in 0..NumProcesses-1 \ {p}
-                        }
-                     )
+sendCommits(p) == sendMsgs(
+                    {
+                        [type |-> "COMMIT",
+                         view_num |-> processState[p].view_num,
+                         commit_num |-> processState[p].commit_num]
+                    }
+                  )
 
 \* Check if there are atleast NumProcesses/2 PREPAREOKs. Note that there is an implicit self PREPAREOK which completes the majority.
 majorityPREPAREOKs(p, log_num) == LET mset == {
-                                        msg \in messages: /\ msg.type = "prepareOk"
+                                        msg \in messages: /\ msg.type = "PREPAREOK"
                                                           /\ msg.view_num = processState[p].view_num
                                                           /\ msg.log_num = log_num
-                                                          /\ msg.to = p
                                     }
-                                  IN /\ Cardinality(mset) >= NumProcesses \div 2
-
-\* In case a higher view number is seen execute some state transfer and catch up. This is needed
-\* in acceptRequest as well. To handle for every case, add a transition in VRNext itself in case
-\* the process sees a message for itself with a higher view number. Handle this later.
+                                  IN Cardinality(mset) >= NumProcesses \div 2
 
 acceptPrepare(p) == /\ \E msg \in messages:
-                        /\ msg.type = "prepare"
-                        /\ msg.to = p
+                        /\ msg.type = "PREPARE"
                         /\ processState[p].view_num = msg.view_num
                         /\ Len(processState[p].log) = msg.log_num - 1
                         /\ processState' = [processState EXCEPT ![p].log = Append(processState[p].log, msg.cmd),
                                                                 ![p].commit_num = msg.commit_num]
                         /\ sendMsgs({
-                                        [type |-> "prepareOk",
-                                         to |-> processState[p].view_num % NumProcesses,
+                                        [type |-> "PREPAREOK",
                                          from |-> p,
                                          view_num |-> processState[p].view_num,
                                          log_num |-> Len(processState[p].log)+1]
                                     })
 
-acceptCommit(p) == /\ \E msg \in messages:
-                        /\ msg.type = "commit"
-                        /\ msg.to = p
-                        /\ processState[p].view_num = msg.view_num
-                        /\ Len(processState[p].log) >= msg.commit_num
-                        /\ processState[p].commit_num < msg.commit_num
-                        /\ processState' = [processState EXCEPT ![p].commit_num = msg.commit_num]
+acceptCommit(p) == \E msg \in messages:
+                     /\ msg.type = "COMMIT"
+                     /\ processState[p].view_num = msg.view_num
+                     /\ Len(processState[p].log) >= msg.commit_num
+                     /\ processState[p].commit_num < msg.commit_num
+                     /\ processState' = [processState EXCEPT ![p].commit_num = msg.commit_num]
 
 (* View change steps *)
 sendStartViewChange(p, new_view_num) == 
-                      /\ new_view_num > processState[p].view_num
-                      /\ processState' = [processState EXCEPT ![p].status = "view_change",
-                                                              ![p].view_num = new_view_num]
-                      /\ sendMsgs({
-                            [type |-> "start_view_change",
-                             to |-> listener,
-                             from |-> p,
-                             view_num |-> new_view_num] : listener \in 0..NumProcesses-1 \ {p}
-                        })
+    /\ new_view_num > processState[p].view_num
+    /\ processState' = [processState EXCEPT ![p].status = "view_change",
+                                            ![p].view_num = new_view_num]
+    /\ sendMsgs({
+          [type |-> "START-VIEW-CHANGE",
+           from |-> p,
+           view_num |-> new_view_num]
+       })
 
-sendDoViewChange(p, newLeader) == /\ sendMsgs({
-                                        [
-                                            type |-> "do_view_change",
-                                            from |-> p,
-                                            to |-> newLeader,
-                                            view_num |-> processState[p].view_num,
-                                            log |-> processState[p].log,
-                                            commit_num |-> processState[p].commit_num,
-                                            last_active_view_num |-> processState[p].last_active_view_num
-                                        ]})
+sendDoViewChange(p) == sendMsgs({
+    [
+        type |-> "DO-VIEW-CHANGE",
+        from |-> p,
+        view_num |-> processState[p].view_num,
+        log |-> processState[p].log,
+        commit_num |-> processState[p].commit_num,
+        last_active_view_num |-> processState[p].last_active_view_num
+    ]})
 
 updateBasedOnStartView(p, msg) == /\ processState' = [processState EXCEPT ![p].status = "normal",
                                                                           ![p].commit_num = msg.commit_num,
@@ -152,35 +206,36 @@ viewChangeTransitions(p) ==
                                    )
                              )
                           \/ (
-                                \* Wait for majority to say view_change and then perform do_view_change
+                                \* Wait for majority to say view_change and then perform DO-VIEW-CHANGE
                                 /\ processState[p].status = "view_change"
                                 /\ LET mset == {
-                                            msg \in messages: /\ msg.type = "start_view_change"
+                                            msg \in messages: /\ msg.type = "START-VIEW-CHANGE"
                                                               /\ msg.view_num = processState[p].view_num
-                                                              /\ msg.to = p
                                         }
-                                   IN /\ Cardinality(mset) >= NumProcesses \div 2
-                                /\ sendDoViewChange(p, processState[p].view_num % NumProcesses)
+                                   IN Cardinality(mset) >= NumProcesses \div 2
+                                /\ sendDoViewChange(p)
                                 /\ processState' = [processState EXCEPT ![p].status = "do_view_change_sent"]
                              )
                           \/ (
-                                \* Remove? - In view_change status, but got view_change with higher number.
-                                /\ \* Got larger start_view_change msg from another node.
-                                   (\E msg \in messages: msg.type = "start_view_change" /\ msg.view_num > processState[p].view_num
-                                      /\ sendStartViewChange(p, msg.view_num))
+                                \* In view_change status, but got view_change with higher number.
+                                \* Got larger start_view_change msg from another node.
+                                \E msg \in messages:
+                                   /\ msg.type = "START-VIEW-CHANGE"
+                                   /\ msg.view_num > processState[p].view_num
+                                   /\ sendStartViewChange(p, msg.view_num)
                              )
                           \/ (
                                 \* In case a start_view msg is received
                                 /\ (
                                       \/ (
-                                          /\ \E msg \in messages: msg.type = "start_view" /\ msg.view_num > processState[p].view_num
+                                          /\ \E msg \in messages: msg.type = "START-VIEW" /\ msg.view_num > processState[p].view_num
                                               /\ updateBasedOnStartView(p, msg)
                                          )
                                       \/ (
                                           \* TODO - Find the invariant to check the case where "normal" wasn't checked when updating with start_view
                                           \* message of same view_num
                                           /\ ~(processState[p].status = "normal")
-                                          /\ \E msg \in messages: msg.type = "start_view" /\ msg.view_num = processState[p].view_num
+                                          /\ \E msg \in messages: msg.type = "START-VIEW" /\ msg.view_num = processState[p].view_num
                                               /\ updateBasedOnStartView(p, msg)
                                          )
                                    )
@@ -190,8 +245,7 @@ viewChangeTransitions(p) ==
 \* There is no "to" field in start_view as it is for all replicas.
 sendStartView(p, v, maxLogMsg) == sendMsgs(
                                 {
-                                    [type |-> "start_view",
-                                     from |-> p,
+                                    [type |-> "START-VIEW",
                                      log |-> maxLogMsg.log,
                                      view_num |-> v,
                                      commit_num |-> maxLogMsg.commit_num]
@@ -200,9 +254,8 @@ sendStartView(p, v, maxLogMsg) == sendMsgs(
 
 recvMajortiyDoViewChange(p, v) == LET
                                         mset == {
-                                            msg \in messages: /\ msg.type = "do_view_change"
+                                            msg \in messages: /\ msg.type = "DO-VIEW-CHANGE"
                                                               /\ msg.view_num = v
-                                                              /\ msg.to = p
                                         }
                                         maxLogMsg == IF mset = {} THEN -1
                                             ELSE CHOOSE msg \in mset : \A msg2 \in mset :
@@ -340,6 +393,7 @@ VRInit == /\ messages = {}
                                                     nonce |-> 0
                                                   ]
                     ]
+          /\ ordering = <<>>
 
 VRNext ==
           \/ \* Normal case operation. Executed only when status of process is normal
@@ -379,14 +433,37 @@ VRNext ==
                 /\ Recover(p)
                 /\ UNCHANGED <<messages>>
 
+LatestActiveViewNum == LET
+                          normal_view_nums == {processState'[p_id].last_active_view_num: p_id \in 0..NumProcesses-1}
+                       IN
+                          Maximum(normal_view_nums)
+
+\* VRNextExt is VRNext with the extension of updating the ordering variable.
+VRNextExt == /\ VRNext
+             /\ \* Set the ordering variable to the ordering as seen at the current leader correponding to the latest active view number.
+                \* If the leader of this latest view number has failed (i.e., is in "recovering" status), the ordering doesn't change
+                \* until a new leader is chosen and reaches "normal" status.
+                \/
+                    /\ processState'[LatestActiveViewNum % NumProcesses].status # "recovering"
+                    /\ LET
+                           mayBeNewOrdering == SubSeq(processState'[LatestActiveViewNum % NumProcesses].log,
+                               1, processState'[LatestActiveViewNum % NumProcesses].commit_num)
+                       IN \* In case a process just became the leader, it might have a few client commands not yet
+                          \* committed which the leader before this process had committed before failing.
+                          \* In this case the outside world will still see an ordering which is only extended in future
+                          \* as all new client commands will be committed only after the commands committed by the previous
+                          \* leader are committed on the new leader i.e., the new leader will catch up in its committed list
+                          \* with the same ordering as the previous leader.
+                          IF Len(ordering) < Len(mayBeNewOrdering) THEN ordering' = mayBeNewOrdering
+                          \* ordering doesn't change till catch up is complete. Also ensure that catch commit list is
+                          \* always a prefix of the ordering.
+                          ELSE /\ ordering' = ordering
+                               /\ Assert(mayBeNewOrdering = SubSeq(ordering, 1, Len(mayBeNewOrdering)), "Old leader forked commit list")
+                \/
+                    /\ processState'[LatestActiveViewNum % NumProcesses].status = "recovering"
+                    /\ ordering' = ordering
+
 (* Invariants *)
-VRTypeOk == /\ processState \in [0..NumProcesses-1 -> [
-                view_num : 0..MaxViewNum,
-                commit_num: 0..Cardinality(ClientCommands),
-                status: {"normal", "view_change", "do_view_change_sent", "recovering"},
-                last_active_view_num: 0..MaxViewNum,
-                log: PossibleLogSeqences(ClientCommands),
-                nonce: 0..MaxFailures]]
 
 (* Invariant - for any two processes, log till lesser commit number is the same (Prefix property) *)
 
@@ -424,4 +501,7 @@ LeaderCommitNumInv == \A a, b \in 0..NumProcesses-1:
                                THEN processState[a].commit_num >= processState[b].commit_num
                                ELSE TRUE
 
+INSTANCE LinearizableOrdering
+
+LnCompliant == LnInit /\ [] [LnNext]_<<ordering>>
 =============================================================================
