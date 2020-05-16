@@ -16,13 +16,11 @@
 \*
 \* This trick is called the WfSimplifier in the spec to succinctly point out conditions added for exactly just this purpose.
 
-
 \* TODOs -
 \*   1. Test VR with flexible quorums (just for fun to check if the spec still works fine)?
 \*   2. Reconfiguration protocol
-\*   3. Consider using symmetry sets where ever possible
-\*   4. Test with a rogue process to prove that it is easy to break correctness with byzantine failures.
-\*   5. Allow state transfer (catch-up)
+\*   3. Run TLC with a rogue process to prove that it is easy to break correctness with byzantine failures.
+\*   4. Allow state transfer (catch-up)
 
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
@@ -31,8 +29,9 @@ CONSTANT
     NumProcesses,
 
     \* ClientCommands is a set of distinct client commands. The specification doesn't bother to maintain a client table as
-    \* it is not relevant to the correctness of the core consensus algorithm - which is to arrive at a specific order for the
-    \* client commands in presence of failures.
+    \* mentioned in the paper as it is not relevant to the correctness of the core consensus algorithm - which is to arrive
+    \* at a specific order for the client commands in presence of failures. The client table is essential to maintain exactly
+    \* once semantics of client requests which is an orthogonal problem to consensus.
     ClientCommands,
 
     \* The maximum view number any process in any bhaviour can attain (this is to restrict the allowed behaviours that TLC
@@ -272,6 +271,7 @@ viewChangeTransitions(p) ==
             /\ LET mset == {
                         msg \in messages: /\ msg.type = "START-VIEW-CHANGE"
                                           /\ msg.view_num = processState[p].view_num
+                                          /\ msg.from # p
                     }
                IN Cardinality(mset) >= NumProcesses \div 2
             /\ sendDoViewChange(p)
@@ -448,10 +448,11 @@ Recover(p) == LET
                               ![p].commit_num = msg.commit_num,
                               ![p].last_active_view_num = maxViewNum,
 
-                              \* TODO - Consider the case where the process increments
-                              \* the nonce and then fails again. Right now, switching
-                              \* to normal and nonce incrementing is atomic, but
-                              \* it should not be so.
+                              \* Not considering the case where the process increments
+                              \* the nonce and then fails before setting status to normal.
+                              \* This spec allows behaviours in which switching to normal
+                              \* status and nonce incrementing is atomic, but it might not
+                              \* be so in some implementation.
                               ![p].nonce = processState[p].nonce + 1]
 
 VRInit == /\ messages = {}
